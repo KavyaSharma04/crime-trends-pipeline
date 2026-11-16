@@ -1,3 +1,4 @@
+
 import os
 import pandas as pd
 from pathlib import Path
@@ -5,7 +6,6 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL, make_url
 
-# Load environment variables from the project .env file.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -21,17 +21,11 @@ def get_database_url():
 
     if target == "local":
         required_env = [
-            "DB_HOST",
-            "DB_PORT",
-            "DB_NAME",
-            "DB_USER",
-            "DB_PASSWORD",
+            "DB_HOST", "DB_PORT", "DB_NAME",
+            "DB_USER", "DB_PASSWORD"
         ]
 
-        missing = [
-            key for key in required_env
-            if not os.getenv(key)
-        ]
+        missing = [key for key in required_env if not os.getenv(key)]
 
         if missing:
             raise ValueError(
@@ -56,25 +50,19 @@ def get_database_url():
             )
 
         url = make_url(render_url)
-
-        # Use psycopg, which is the driver used by this project.
         url = url.set(drivername="postgresql+psycopg")
 
-        # Render PostgreSQL connections require SSL.
         query = dict(url.query)
         query.setdefault("sslmode", "require")
-        url = url.set(query=query)
 
-        return url
+        return url.set(query=query)
 
     else:
-        raise ValueError(
-            "Invalid DB_TARGET. Use 'local' or 'render'."
-        )
+        raise ValueError("Invalid DB_TARGET. Use 'local' or 'render'.")
 
 
 def load_crime_data():
-    """Load cleaned crime records into the selected PostgreSQL database."""
+    """Safely insert or update crime records using file_number."""
 
     target = os.getenv("DB_TARGET", "local").strip().lower()
     print(f"Loading cleaned crime data into {target.upper()} PostgreSQL...")
@@ -87,50 +75,92 @@ def load_crime_data():
 
     df = pd.read_csv(CLEANED_FILE)
 
-    # Convert date columns into actual datetime values.
-    df["date_of_report"] = pd.to_datetime(
-        df["date_of_report"], errors="coerce"
-    )
-    df["crime_date_time"] = pd.to_datetime(
-        df["crime_date_time"], errors="coerce"
-    )
-
     if df.empty:
         raise ValueError("The cleaned dataset is empty.")
+
+    required_columns = [
+        "file_number", "date_of_report", "crime_date_time",
+        "crime", "reporting_area", "neighborhood", "location",
+        "reporting_area_lat", "reporting_area_lon",
+        "reporting_area_location", "crime_date_time_original",
+        "crime_year", "crime_month", "crime_day_of_week",
+        "crime_hour"
+    ]
+
+    if list(df.columns) != required_columns:
+        raise ValueError(
+            "CSV columns do not match the expected database schema."
+        )
+
+    if df["file_number"].isna().any():
+        raise ValueError("Missing file_number values found.")
+
+    if df["file_number"].duplicated().any():
+        raise ValueError("Duplicate file_number values found in CSV.")
+
+    for column in ["date_of_report", "crime_date_time"]:
+        df[column] = pd.to_datetime(df[column], errors="coerce")
 
     connection_url = get_database_url()
     engine = create_engine(connection_url, pool_pre_ping=True)
 
-    try:
-        # NOTE: replace recreates the crime_reports table on each run.
-        df.to_sql(
-            name="crime_reports",
-            con=engine,
-            schema="public",
-            if_exists="replace",
-            index=False,
-            chunksize=500,
-            method="multi",
-        )
+    columns = ", ".join(f'"{col}"' for col in required_columns)
+    placeholders = ", ".join(f":{col}" for col in required_columns)
 
-        with engine.connect() as connection:
-            count = connection.execute(
-                text("SELECT COUNT(*) FROM public.crime_reports")
-            ).scalar_one()
+    update_columns = [
+        col for col in required_columns if col != "file_number"
+    ]
+
+    update_clause = ", ".join(
+        f'"{col}" = EXCLUDED."{col}"' for col in update_columns
+    )
+
+    upsert_query = text(f"""
+        INSERT INTO public.crime_reports ({columns})
+        VALUES ({placeholders})
+        ON CONFLICT (file_number)
+        DO UPDATE SET {update_clause}
+    """)
+
+    records = df.astype(object).where(pd.notna(df), None).to_dict(
+        orient="records"
+    )
+
+    try:
+        with engine.begin() as connection:
+            # Verify that file_number is unique in the target table.
+            unique_check = connection.execute(text("""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT file_number
+                    FROM public.crime_reports
+                    GROUP BY file_number
+                    HAVING COUNT(*) > 1
+                ) duplicates
+            """)).scalar_one()
+
+            if unique_check:
+                raise RuntimeError(
+                    "Existing table contains duplicate file_number values."
+                )
+
+            # A unique constraint/index is required for ON CONFLICT.
+            connection.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_crime_reports_file_number
+                ON public.crime_reports (file_number)
+            """))
+
+            connection.execute(upsert_query, records)
+
+            count = connection.execute(text("""
+                SELECT COUNT(*) FROM public.crime_reports
+            """)).scalar_one()
 
         print(f"Records in cleaned CSV: {len(df)}")
-        print(f"Records loaded into PostgreSQL: {count}")
-
-        if count != len(df):
-            raise RuntimeError(
-                "Record count mismatch between CSV and PostgreSQL."
-            )
-
-        print(f"Data loaded and verified successfully in {target.upper()}!")
+        print(f"Records in PostgreSQL: {count}")
+        print(f"Data safely loaded into {target.upper()}!")
 
     finally:
         engine.dispose()
 
-
-if __name__ == "__main__":
-    load_crime_data()
